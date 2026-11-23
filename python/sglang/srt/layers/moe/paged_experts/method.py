@@ -188,7 +188,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config  # rebuilt with the final K
         self._create_runner(layer)
-        self.contract = contract_for(self.runner)
+        self.contract = contract_for(self.runner, self.base_method)
         self.routed_scaling_factor = moe_runner_config.routed_scaling_factor or 1.0
         # Loads wait as views of the mapped checkpoint: the post-load step replays them K
         # experts at a time.
@@ -483,7 +483,14 @@ def _cap_decode_capture_batch_sizes(max_bs: int) -> None:
     decode.max_bs = cap
 
 
-def check_paged_experts_compat(layer, expert_format) -> None:
+def _base_method(layer):
+    """The method whose experts the layer pages: the paged wrapper keeps it as
+    ``base_method``, a layer still being built has its own as ``quant_method``."""
+    method = getattr(layer, "quant_method", None)
+    return getattr(method, "base_method", method)
+
+
+def check_paged_experts_compat(layer, expert_format, base_method=None) -> None:
     """Raise if the server or layer configuration is outside what paged experts supports;
     ``expert_format`` is None when no format handles the layer's quantization method."""
 
@@ -532,9 +539,21 @@ def check_paged_experts_compat(layer, expert_format) -> None:
                 problems.append(
                     f"{flag} needs an explicit --paged-experts-num-resident, not auto"
                 )
+    base_method = base_method if base_method is not None else _base_method(layer)
+    if (
+        getattr(base_method, "is_fp4_expert", False)
+        and not getattr(base_method, "dequant_fp4_to_fp8", False)
+    ):
+        # Its experts stay MXFP4-packed, which no format here serves on this device: say what
+        # to set, instead of only listing the formats.
+        problems.append(
+            "MXFP4-packed experts need SGLANG_DSV4_FP4_DEQUANT=1, which dequantizes them to "
+            "block FP8 as they load; leave --moe-runner-backend on auto (it cannot be "
+            "combined with marlin, and MXFP4 Marlin itself requires SM90 or SM120)"
+        )
     if expert_format is None:
         problems.append(
-            f"{type(layer.quant_method).__name__} experts are not supported; supported are "
+            f"{type(base_method).__name__} experts are not supported; supported are "
             + ", ".join(fmt.label for fmt in FORMATS)
         )
     if get_exec().moe.enable_fused_moe_sum_all_reduce:
