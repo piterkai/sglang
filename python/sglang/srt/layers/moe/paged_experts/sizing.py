@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_mm,
     get_model,
+    get_parallel,
     get_schedule,
 )
 
@@ -65,6 +66,26 @@ def kv_floor(model_context_len: int) -> KVFloor:
     )
 
 
+def _world_cpu_group():
+    """The WORLD CPU group when these ranks must agree, else None.
+
+    None without a process group, and at a launch width of 1: a single rank has nobody to
+    agree with (``get_available_gpu_memory`` then skips its own all-reduce)."""
+    import torch.distributed
+
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return None
+    parallel = get_parallel()
+    try:
+        if parallel.launch_world_size <= 1:
+            return None
+        return parallel.world_group.cpu_group
+    except (AttributeError, RuntimeError):
+        # Nothing published this process yet (unit tests, a caller before the ranks are
+        # known): there is no other rank to agree with.
+        return None
+
+
 def static_budget_bytes(kv_configurator, pre_model_load_memory: float) -> int:
     """What is left of the static budget (``--mem-fraction-static``): free memory less the
     non-static slack and the multimodal reserve, as the KV configurator measures it (its other
@@ -73,13 +94,41 @@ def static_budget_bytes(kv_configurator, pre_model_load_memory: float) -> int:
     from sglang.srt.utils.device import get_available_gpu_memory
 
     gc.collect()
-    free_gb = get_available_gpu_memory(kv_configurator.device, kv_configurator.gpu_id)
+    # The smallest free memory over the ranks, as the KV configurator measures it: every rank
+    # must size the same K, or their captured graphs and collectives would disagree.
+    cpu_group = _world_cpu_group()
+    free_gb = get_available_gpu_memory(
+        kv_configurator.device,
+        kv_configurator.gpu_id,
+        distributed=cpu_group is not None,
+        cpu_group=cpu_group,
+    )
     slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
     mm_gb = mm_runtime_reservation_gb(
         is_multimodal=kv_configurator.model_config.is_multimodal,
         mm_feature_transport=get_mm().mm_feature_transport,
     )
     return int((free_gb - slack_gb - mm_gb) * _GIB)
+
+
+def _world_min(values: List[int]) -> List[int]:
+    """``values``, each lowered to the smallest one any rank has.
+
+    The ranks must plan the same K and read the same KV capacity: decode CUDA graphs are
+    captured at K // top_k requests (``_cap_decode_capture_batch_sizes``), so a rank with a
+    larger K would capture batches the others did not, and their collectives would then
+    disagree. One all-reduce for the whole list."""
+    import torch.distributed
+
+    cpu_group = _world_cpu_group()
+    if cpu_group is None:
+        return list(values)
+    # int64, on the world CPU group, as the KV configurator's own sync uses.
+    tensor = torch.tensor(list(values), dtype=torch.int64)
+    torch.distributed.all_reduce(
+        tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
+    )
+    return [int(v) for v in tensor.tolist()]
 
 
 def _mamba_charge(slots: int, per_slot: int) -> int:
@@ -225,6 +274,9 @@ class ExpertSlotSizing:
             _router_top_k,
         )
 
+        # The KV cache is measured on each rank's own GPU: the smallest is what every rank
+        # may plan against, as the PP sync does for layer counts elsewhere.
+        kv_tokens = _world_min([kv_tokens])[0]
         floor = self.floor
         page = get_schedule().page_size
         short = kv_tokens + page <= floor.minimum
@@ -273,6 +325,9 @@ class ExpertSlotSizing:
             )
         # On the disk tier a layer grows to its host rows at most.
         ks = self._grow(base, [m.max_resident for m in methods], row, spare)
+        # The budget above is the world minimum, but a rank whose slots round differently
+        # must still end on the same K: settle on the smallest.
+        ks = _world_min(ks)
         slab = self._allocate(ks, methods)
         offset = 0
         for layer, m, k in zip(self.layers, methods, ks):
