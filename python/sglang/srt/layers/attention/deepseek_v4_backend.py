@@ -259,7 +259,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if get_platform().is_sm120 or _is_xpu:
+    # SM120 and SM89 decode through the portable flash_mla_sm120 fallback, which
+    # takes no split-KV schedule.
+    if get_platform().is_sm120 or _is_xpu or is_sm89():
         return None
     from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
@@ -1370,12 +1372,14 @@ class DeepseekV4AttnBackend(
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
-        if is_cuda():
+        self._swa_interleaved = (
+            self.token_to_kv_pool.get_swa_key_layout().is_interleaved
+        )
+        # SM89 decodes through the portable flash_mla_sm120 fallback and must not
+        # import flash_mla at all: there is no SM89 kernel in that wheel.
+        if is_cuda() and not is_sm89():
             from sglang.kernels.ops.attention import flash_mla_interface
 
-            self._swa_interleaved = (
-                self.token_to_kv_pool.get_swa_key_layout().is_interleaved
-            )
             self._flash_mla_with_kvcache = functools.partial(
                 flash_mla_interface.flash_mla_with_kvcache,
                 use_legacy=not self._swa_interleaved,
@@ -4578,7 +4582,7 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths,
                 )
 
-            if get_platform().is_sm120:
+            if get_platform().is_sm120 or is_sm89():
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,

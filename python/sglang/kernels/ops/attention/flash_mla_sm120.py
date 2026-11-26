@@ -1,11 +1,11 @@
-"""SM120 FlashMLA sparse decode implementation.
+"""Portable FlashMLA sparse decode for GPUs the flash_mla CUDA kernel does not cover.
 
-On SM120 (Blackwell Desktop / RTX PRO 6000) the flash_mla CUDA kernel
-is not available, so this module provides alternative implementations,
-selected by ``SGLANG_SM120_FLASHMLA_BACKEND``:
+SM120 (Blackwell Desktop / RTX PRO 6000) and SM89 (Ada / L20) have no flash_mla
+decode kernel, so this module provides alternative implementations of the
+DeepSeek-V4 584 B sparse decode, selected by ``SGLANG_SM120_FLASHMLA_BACKEND``:
 
-- FlashInfer's SM120 sparse MLA decode (``flashinfer``, the default)
-- A fused Triton kernel (``triton``)
+- FlashInfer's SM120 sparse MLA decode (``flashinfer``, the SM120 default; SM120 only)
+- A fused Triton kernel (``triton``, forced on SM89)
 - A pure-PyTorch fallback (``torch``)
 
 The FP8 KV cache uses a page-internal layout where NOPE+ROPE data has
@@ -23,7 +23,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_sm89
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
@@ -209,6 +209,13 @@ def _sm120_sparse_decode_fwd(
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
 # Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+if is_sm89() and _sm120_default_backend == "flashinfer":
+    # FlashInfer's sparse MLA here is a CUTLASS SM120 kernel; Ada has no image.
+    logger.warning(
+        "SGLANG_SM120_FLASHMLA_BACKEND=flashinfer is unavailable on SM89; "
+        "using the Triton implementation."
+    )
+    _sm120_default_backend = "triton"
 
 
 SM120_DECODE_MAX_TOKENS = 64
