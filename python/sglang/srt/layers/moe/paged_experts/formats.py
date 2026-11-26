@@ -115,6 +115,14 @@ class PostLoad:
         # the state before the first.
         self._state = {k: v for k, v in vars(layer).items() if k not in _MODULE_ATTRS}
         self._params = set(layer._parameters)
+        # The step also records state on the method itself (e.g. that it no longer has FP4
+        # experts, once it dequantized the chunk it last ran on); each run starts from the
+        # state before the first, so the next chunk's step does the same work.
+        self._method_state = {
+            k: v
+            for k, v in vars(base_method).items()
+            if isinstance(v, (bool, int, float, str, type(None)))
+        }
         self._runs = 0
 
     def run(
@@ -215,6 +223,8 @@ class PostLoad:
         # `w13_weight_scale_inv`).
         for name in [name for name in layer._parameters if name not in self._params]:
             delattr(layer, name)
+        for k, v in self._method_state.items():
+            setattr(self.base_method, k, v)
         for name, template in self._templates.items():
             layer.register_parameter(name, template)
 
@@ -276,6 +286,15 @@ class UnquantizedFormat(ExpertFormat):
         return isinstance(base_method, UnquantizedFusedMoEMethod)
 
 
+def _dequantizes_fp4_experts(base_method) -> bool:
+    """Whether the method serves MXFP4-packed checkpoint experts as block FP8.
+
+    ``is_fp4_expert`` is still True while the layer is built: only the post-load step clears
+    it, and that runs once the weights are loaded.
+    """
+    return getattr(base_method, "dequant_fp4_to_fp8", False) is True
+
+
 class Fp8BlockFormat(ExpertFormat):
     """FP8 weights with per-block scales (e.g. 128x128) and dynamic activation scales."""
 
@@ -290,7 +309,27 @@ class Fp8BlockFormat(ExpertFormat):
             and base_method.quant_config.weight_block_size is not None
             and base_method.quant_config.is_checkpoint_fp8_serialized
             and not base_method.use_mxfp8
-            and not base_method.is_fp4_expert
+            # Dequantized FP4 experts are block FP8 by the time they are paged.
+            and (not base_method.is_fp4_expert or _dequantizes_fp4_experts(base_method))
+        )
+
+
+class Fp8DequantFp4ExpertsFormat(Fp8BlockFormat):
+    """MXFP4-packed routed experts of an FP8 checkpoint, dequantized to block FP8 as they
+    load (``SGLANG_DSV4_FP4_DEQUANT=1``): the pages hold FP8 rows, not the packed ones."""
+
+    label = "block-FP8 (dequantized from MXFP4 experts)"
+
+    @classmethod
+    def supports(cls, base_method, scheme) -> bool:
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        return (
+            isinstance(base_method, Fp8MoEMethod)
+            and base_method.is_fp4_expert
+            and _dequantizes_fp4_experts(base_method)
+            and base_method.quant_config.weight_block_size is not None
+            and not base_method.use_mxfp8
         )
 
 
@@ -456,6 +495,7 @@ class _ThroughMarlinRunner:
 
 FORMATS = (
     UnquantizedFormat,
+    Fp8DequantFp4ExpertsFormat,
     Fp8BlockFormat,
     W8A8Fp8Format,
     W8A8Int8Format,

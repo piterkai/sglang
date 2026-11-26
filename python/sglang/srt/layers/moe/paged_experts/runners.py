@@ -282,7 +282,16 @@ class MarlinContract(RunnerContract):
         moe_sum_reduce(entries, out, routed_scaling_factor)
 
 
+class TritonRepackContract(TritonContract):
+    """Triton runner over experts the base method rewrites as it loads them (FP4 experts
+    dequantized to block FP8): as with Marlin, the post-load step runs over the host store
+    K experts at a time, so it must treat every expert on its own."""
+
+    repacks = True
+
+
 TRITON = TritonContract()
+TRITON_REPACK = TritonRepackContract()
 MARLIN = MarlinContract()
 
 
@@ -296,10 +305,21 @@ def runner_of(base_method, layer):
     return None
 
 
-def contract_for(runner) -> RunnerContract:
-    """The contract of the runner the base method built for paged experts."""
+def _repacks_experts(base_method) -> bool:
+    """Whether the base method's post-load step rewrites the expert weights: dequantized FP4
+    experts are another layout than the checkpoint's pages."""
+    return getattr(base_method, "dequant_fp4_to_fp8", False) is True
+
+
+def contract_for(runner, base_method=None) -> RunnerContract:
+    """The contract of the runner the base method built for paged experts.
+
+    ``base_method`` is given where the caller has it: a method that rewrites the experts as
+    they load needs the repacking contract, which the Triton runner does not imply."""
     backend = getattr(runner, "runner_backend", None)
     if backend is not None and backend.is_triton():
+        if base_method is not None and _repacks_experts(base_method):
+            return TRITON_REPACK
         return TRITON
     if (
         backend is not None
