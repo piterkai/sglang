@@ -297,6 +297,19 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         return offset
 
     def _set_num_slots(self, layer, num_slots: int) -> None:
+        # Paging replaces the expert table with K slots on every rank, so the layer must
+        # already own all of its experts: with expert parallelism it would not (the layer
+        # divides its routed experts by the EP width), and the slot table would then hold
+        # another rank's experts under the checkpoint's ids. The counts appear when the
+        # layer is built; a layer that has them not yet has nothing to check.
+        local = getattr(layer, "_num_local_routed", None)
+        global_ = getattr(layer, "_num_global_routed", None)
+        if local is not None and global_ is not None:
+            assert local == global_, (
+                f"Paged experts: the layer owns {local} of its {global_} routed experts, "
+                "so it cannot page them; paged experts supports tensor parallel, not expert "
+                "parallelism or EPLB"
+            )
         layer.num_local_experts = num_slots
         layer._num_local_routed = layer._num_global_routed = num_slots
 
@@ -505,9 +518,17 @@ def check_paged_experts_compat(layer, expert_format, base_method=None) -> None:
 
     problems = []
     parallel = get_parallel()
-    for name in ("tp_size", "ep_size", "pp_size", "dp_size"):
+    # Tensor parallelism keeps working: each rank holds its own slice of every expert (the
+    # host rows are that slice, as the loader narrows w1/w2/w3 to ``moe_tp_rank``), pages it
+    # on its own, and the layer's all-reduce sums the ranks as it does unpaged. Expert,
+    # pipeline and data parallelism stay out: their ranks would have to page experts they do
+    # not own, or run beside a second copy of the model.
+    for name in ("ep_size", "pp_size", "dp_size"):
         if getattr(parallel, name) > 1:
-            problems.append(f"--{name.replace('_', '-')} must be 1 (single GPU only)")
+            problems.append(
+                f"--{name.replace('_', '-')} must be 1 (paged experts supports tensor "
+                "parallel only)"
+            )
     if get_exec().moe.enable_eplb:
         problems.append("--enable-eplb is not supported")
     if get_spec().speculative_algorithm:

@@ -77,9 +77,13 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   | ModelOpt NVFP4 | Marlin | pass `--moe-runner-backend marlin`; runs W4A16 |
 
   Other quantization methods and MoE runners are rejected at startup.
-- **Single GPU:** tensor, expert, pipeline and data parallelism, EPLB, fused shared experts
-  (use `--disable-shared-experts-fusion`) and `--enable-fused-moe-sum-all-reduce` are rejected
-  at startup.
+- **Parallelism:** tensor parallelism (`--tp-size`) works. Each rank keeps its own host store
+  of all E experts in its own tensor-parallel shard, so the pinned host memory per rank is the
+  per-rank share of the expert weights: at `--tp-size 2` it is about half what one rank pins at
+  `--tp-size 1` (Qwen3-30B-A3B: 27 GiB/rank at TP=2, 54 GiB at TP=1). Sizing the hosts for a
+  TP=2 deployment therefore takes the TP=1 figure, not twice it. Expert, pipeline and data
+  parallelism, EPLB, fused shared experts (use `--disable-shared-experts-fusion`) and
+  `--enable-fused-moe-sum-all-reduce` are rejected at startup.
 - **Speculative decoding** is rejected at startup.
 - **Load formats:** `--load-format auto` (the default), `safetensors`, `pt`, `npcache`,
   `mistral`, `fastsafetensors`, `instanttensor` and `runai_streamer`. The others are rejected
@@ -89,9 +93,10 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   prefill graphs may use the `breakable` backend (the default on CUDA) or be disabled. Other
   combinations are rejected at startup.
 - **Host memory:** the host store holds all E experts of every MoE layer and is page-locked, so
-  the host must be able to pin that much memory, or the disk tier holds the rest. Under WSL2,
-  pinned memory is capped at about half of system RAM: set `--paged-experts-host-memory-gb`
-  below that.
+  the host must be able to pin that much memory, or the disk tier holds the rest. With tensor
+  parallelism that is per rank the rank's own shard of every expert: plan `--tp-size` times the
+  per-rank figure, which is the single-rank figure divided by the TP width. Under WSL2, pinned
+  memory is capped at about half of system RAM: set `--paged-experts-host-memory-gb` below that.
 - **Disk tier** ([below](#disk-tier); R is the experts per layer in host memory): x86-64 hosts
   only for now. The first start writes every layer's file once, about the size of the expert
   weights, and keeps 8 GiB of the disk free; the space is checked at startup. The checkpoint must
@@ -331,6 +336,11 @@ loaded, in two steps:
 
 So under `auto`, `--context-length`, `--max-running-requests` and `--max-total-tokens` decide
 the KV cache, and they are also the knobs that trade context and concurrency for resident experts.
+
+With `--paged-experts-num-resident` set to a number, none of this runs: K is the number given, and
+the KV cache keeps whatever `--mem-fraction-static` leaves after the slots. Under tensor
+parallelism every rank then uses that same K, because it comes from the command line; the sizing
+step, and with it the cross-rank comparison it makes, is skipped.
 At startup the server logs the chosen K, the KV cache it kept and why, and how many full-length
 requests fit at once:
 

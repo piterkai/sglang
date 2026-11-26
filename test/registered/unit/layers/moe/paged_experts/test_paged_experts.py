@@ -1171,7 +1171,15 @@ class TestFormats(CustomTestCase):
 
 class TestCompat(CustomTestCase):
     def _check(
-        self, num_resident=K, speculative_algorithm=None, load_format="auto", **flags
+        self,
+        num_resident=K,
+        speculative_algorithm=None,
+        load_format="auto",
+        tp_size=1,
+        ep_size=1,
+        pp_size=1,
+        dp_size=1,
+        **flags,
     ):
         method = "sglang.srt.layers.moe.paged_experts.method."
         moe = SimpleNamespace(
@@ -1191,7 +1199,10 @@ class TestCompat(CustomTestCase):
             patch(
                 method + "get_parallel",
                 return_value=SimpleNamespace(
-                    tp_size=1, ep_size=1, pp_size=1, dp_size=1
+                    tp_size=tp_size,
+                    ep_size=ep_size,
+                    pp_size=pp_size,
+                    dp_size=dp_size,
                 ),
             ),
             patch(
@@ -1253,6 +1264,31 @@ class TestCompat(CustomTestCase):
                 ):
                     self._check(load_format=load_format)
 
+    def test_accepts_tensor_parallelism(self):
+        """Tensor parallelism is supported: each rank holds and pages its own slice of every
+        expert, so --tp-size 2, 4 and 8 all pass the compatibility check."""
+        for tp_size in (2, 4, 8):
+            with self.subTest(tp_size=tp_size):
+                self._check(tp_size=tp_size)
+
+    def test_still_rejects_expert_pipeline_and_data_parallelism(self):
+        """The widths that would need another rank's experts, another layer, or another copy
+        of the model stay refused, named with their flag, and the message no longer claims a
+        single GPU."""
+        for name in ("ep_size", "pp_size", "dp_size"):
+            with self.subTest(width=name):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    f"--{name.replace('_', '-')} must be 1 "
+                    r"\(paged experts supports tensor parallel only\)",
+                ):
+                    self._check(**{name: 2})
+        with self.assertRaisesRegex(RuntimeError, "parallel only"):
+            self._check(tp_size=2, ep_size=2)
+        with self.assertRaises(RuntimeError) as raised:
+            self._check(ep_size=2)
+        self.assertNotIn("single GPU", str(raised.exception))
+
     def test_rejects_speculative_decoding(self):
         with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
             self._check(speculative_algorithm="EAGLE")
@@ -1274,6 +1310,44 @@ class TestCompat(CustomTestCase):
                     ):
                         self._check(num_resident=auto, **{flag: True})
                 self._check(num_resident=K, **{flag: True})  # an explicit K is fine
+
+
+class TestWorldMin(CustomTestCase):
+    """The cross-rank agreement the sizing needs: K and the KV capacity must be the same on
+    every rank, or the decode graphs each rank captures would differ."""
+
+    _SIZING = "sglang.srt.layers.moe.paged_experts.sizing."
+
+    def test_a_single_rank_does_not_synchronize(self):
+        """Without a process group (a unit test, --tp-size 1, or before the groups exist) the
+        values come back untouched: no all-reduce is attempted."""
+        with (
+            patch(self._SIZING + "_world_cpu_group", return_value=None),
+            patch.object(torch.distributed, "all_reduce") as all_reduce,
+        ):
+            self.assertEqual(sizing._world_min([3, 4, 5]), [3, 4, 5])
+            self.assertEqual(sizing._world_min([]), [])
+            all_reduce.assert_not_called()
+
+    def test_every_value_is_lowered_to_the_smallest(self):
+        """With a group, one int64 all-reduce with ReduceOp.MIN carries the whole list."""
+        group = object()
+        seen = {}
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            seen["dtype"] = tensor.dtype
+            seen["op"] = op
+            seen["group"] = group
+            tensor.fill_(16)  # what the smallest rank would contribute
+
+        with (
+            patch(self._SIZING + "_world_cpu_group", return_value=group),
+            patch.object(torch.distributed, "all_reduce", side_effect=fake_all_reduce),
+        ):
+            self.assertEqual(sizing._world_min([32, 16, 24]), [16, 16, 16])
+        self.assertEqual(seen["dtype"], torch.int64)
+        self.assertEqual(seen["op"], torch.distributed.ReduceOp.MIN)
+        self.assertIs(seen["group"], group)
 
 
 class TestSizing(CustomTestCase):

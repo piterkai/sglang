@@ -83,6 +83,13 @@ class HostExpertStore:
     """Holds all E experts of each paged tensor on the host, in the layer's GPU layout,
     page-locked. ``page_in`` is planned on the host; ``gather`` reads a plan on the GPU.
 
+    The rows follow the layer's own expert tensors (``rows_like``), so under tensor
+    parallelism each row is that rank's shard: the base method allocates the experts at
+    ``intermediate_size_per_partition == intermediate_size // moe_tp_size``, and the loader
+    narrows the checkpoint's w1/w3 by ``moe_tp_rank`` into the row (``_make_host_loader``).
+    A rank therefore pins E shards of its own, not the whole expert: at TP=2 the host store
+    is half the size it is at TP=1, and no rank pages another rank's bytes.
+
     The GPU tensors are looked up on the layer at every transfer, because a quantization
     method may rebind them after loading.
     """

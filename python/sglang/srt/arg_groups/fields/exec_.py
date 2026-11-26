@@ -1143,7 +1143,10 @@ class ExecMoe(msgspec.Struct):
     enable_paged_experts: A[
         bool,
         "Keep only --paged-experts-num-resident (K) routed experts per MoE layer on the GPU and "
-        "page the rest from pinned host memory on demand. Single GPU; the experts must run on the "
+        "page the rest from pinned host memory on demand. With tensor parallelism each rank "
+        "keeps its own host store of that rank's tensor-parallel shard of every expert, so the "
+        "pinned memory per rank is the per-rank share; expert, pipeline and data parallelism are "
+        "not supported. The experts must run on the "
         "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
         "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
         "graphs must be breakable or disabled.",
