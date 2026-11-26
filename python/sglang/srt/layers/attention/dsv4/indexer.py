@@ -59,7 +59,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import is_cuda, is_hip, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_sm89, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -608,7 +608,7 @@ class C4IndexerBackendMixin:
             return False
         # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
-        if not is_cuda() or is_hip():
+        if not is_cuda() or is_hip() or is_sm89():
             return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
@@ -864,8 +864,10 @@ class C4IndexerBackendMixin:
             )
         elif is_hip():
             fn = _aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if get_platform().is_sm120:
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or is_sm89():
+            # SM89 has no DeepGEMM kernels at all; the SM120 torch path is the
+            # portable implementation of the same V4 indexer logits.
+            if get_platform().is_sm120 or is_sm89():
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch
@@ -901,8 +903,8 @@ class C4IndexerBackendMixin:
         )
         _use_aiter = is_hip() and not use_fp4_indexer
         _use_torch_fn = (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
-        )
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or is_sm89()
+        ) and not use_fp4_indexer
         if (
             _c4sl.dim() == 1
             and not _use_tilelang
