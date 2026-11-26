@@ -156,7 +156,7 @@ from sglang.srt.speculative.ragged_verify import (
     compute_uniform_extend_lengths,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_sm89, is_xpu
 from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
@@ -3097,6 +3097,7 @@ class DeepseekV4AttnBackend(
             and forward_batch.forward_mode.is_extend_without_speculative()
             and (not cp_active or cp_sparse_prefill)
             and not get_platform().is_sm120
+            and not is_sm89()
             and self.forward_metadata.late_layer_tail is None
             and (
                 cp_sparse_prefill
