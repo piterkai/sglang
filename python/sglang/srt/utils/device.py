@@ -67,6 +67,7 @@ __all__ = [
     "is_sm90_supported",
     "is_sm120",
     "is_sm121",
+    "is_sm89",
     "is_amx_tile_supported",
     "cpu_has_amx_support",
     "use_intel_amx_backend",
@@ -346,6 +347,14 @@ def is_sm90_supported() -> bool:
 @lru_cache(maxsize=1)
 def is_sm120() -> bool:
     return is_cuda() and torch.cuda.get_device_capability() == (12, 0)
+
+
+# Ada (L20 and friends). No TMA, wgmma, tcgen05 or thread-block clusters, so
+# the SM90/SM100 FlashMLA kernels do not run there; the SM89 port is selected
+# by exact capability rather than by major.
+@lru_cache(maxsize=1)
+def is_sm89() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (8, 9)
 
 
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
