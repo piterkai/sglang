@@ -258,10 +258,50 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
 
+@functools.lru_cache(maxsize=1)
+def _sm89_native_available() -> bool:
+    """Whether the installed flash_mla wheel carries the SM89 extension."""
+    import glob
+    import importlib.util
+    import os
+
+    try:
+        spec = importlib.util.find_spec("flash_mla")
+    except (ImportError, ValueError):
+        return False
+    if spec is None or not spec.submodule_search_locations:
+        return False
+    return any(
+        glob.glob(os.path.join(location, "_C_sm89.*.so"))
+        for location in spec.submodule_search_locations
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _sm89_uses_native() -> bool:
+    """Pick the SM89 FlashMLA implementation from SGLANG_SM89_FLASHMLA_BACKEND."""
+    choice = envs.SGLANG_SM89_FLASHMLA_BACKEND.get()
+    if choice == "auto":
+        return _sm89_native_available()
+    if choice == "native":
+        if not _sm89_native_available():
+            raise ValueError(
+                "SGLANG_SM89_FLASHMLA_BACKEND=native needs an sgl-flash-ml wheel "
+                "with the _C_sm89 extension."
+            )
+        return True
+    if choice in ("triton", "torch"):
+        return False
+    raise ValueError(
+        "SGLANG_SM89_FLASHMLA_BACKEND must be auto, native, triton or torch; "
+        f"got {choice!r}."
+    )
+
+
 def _create_flashmla_metadata():
-    # SM120 and SM89 decode through the portable flash_mla_sm120 fallback, which
-    # takes no split-KV schedule.
-    if get_platform().is_sm120 or _is_xpu or is_sm89():
+    # SM120 and the SM89 fallback decode through flash_mla_sm120, which takes no
+    # split-KV schedule; only the native SM89 path needs the empty schedule.
+    if get_platform().is_sm120 or _is_xpu or (is_sm89() and not _sm89_uses_native()):
         return None
     from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
@@ -1375,9 +1415,9 @@ class DeepseekV4AttnBackend(
         self._swa_interleaved = (
             self.token_to_kv_pool.get_swa_key_layout().is_interleaved
         )
-        # SM89 decodes through the portable flash_mla_sm120 fallback and must not
-        # import flash_mla at all: there is no SM89 kernel in that wheel.
-        if is_cuda() and not is_sm89():
+        # The SM89 fallback must not import flash_mla at all; the native path does.
+        # SGLANG_SM89_FLASHMLA_BACKEND=auto picks native when the wheel is installed.
+        if is_cuda() and not (is_sm89() and not _sm89_uses_native()):
             from sglang.kernels.ops.attention import flash_mla_interface
 
             self._flash_mla_with_kvcache = functools.partial(
@@ -4582,7 +4622,7 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths,
                 )
 
-            if get_platform().is_sm120 or is_sm89():
+            if get_platform().is_sm120 or (is_sm89() and not _sm89_uses_native()):
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,

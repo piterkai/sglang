@@ -1476,6 +1476,11 @@ class Envs:
     SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS_MIN_BS = EnvInt(12)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # SM89 FlashMLA decode implementation: "auto" (default) uses the native
+    # `_C_sm89` wheel when it is installed and the portable fallback otherwise;
+    # "native" requires that wheel; "triton"/"torch" force the fallback and pick
+    # its backend, overriding SGLANG_SM120_FLASHMLA_BACKEND.
+    SGLANG_SM89_FLASHMLA_BACKEND = EnvStr("auto")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
